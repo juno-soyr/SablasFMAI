@@ -1,0 +1,10 @@
+# Core scientific and plotting dependencies
+numpy
+scipy
+matplotlib
+tqdm
+
+# Optimization and learning dependencies
+cvxpy
+gurobipy
+torch
