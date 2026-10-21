@@ -8,7 +8,7 @@ import astropy.units as u
 
 
 # Save data file in `data` directory
-FILE_PATH = "data/Artemis_II_OEM_2026_04_06_Pre"
+FILE_PATH = "data/Artemis_II_OEM_2026_04_06_Pre-OTC3_to_EI.asc"
 OUTPUT_DIR = "figures"
 
 # Create a Path object for the figures directory
