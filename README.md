@@ -16,7 +16,8 @@ Section, equation and algorithm numbers below refer to that version.
 | [sablas_torch.py](sablas_torch.py) | The barrier network, the controller network, the dataset, the loss and the training loop | Sec. III-B, III-C, IV-B, Alg. 1, V-D |
 | [eval_torch.py](eval_torch.py) | Tests a trained agent against the nominal controller and checks the barrier conditions on held-out data | Sec. V-B, V-F, Eq. (2) |
 | [run_sablas.py](run_sablas.py) | Runs everything in order: environment check, unit checks, smoke test, training, verification | Thm. 1 (unit check) |
-| `sablas/` | The authors' reference code ([MIT-REALM/sablas](https://github.com/MIT-REALM/sablas)) that the port follows | — |
+
+The port follows the authors' reference code, [MIT-REALM/sablas](https://github.com/MIT-REALM/sablas), which is not included here.
 
 The dependencies go one way: `cw_env` imports nothing from the project, `sablas_torch` imports `cw_env`, `eval_torch` imports both, and `run_sablas` calls the other two as subprocesses.
 
@@ -113,6 +114,11 @@ Differences from the paper's equations, all inherited from the authors' code (`m
 - `Lg` is a dead-zone L1 penalty instead of the squared norm in Eq. (4).
 
 One difference is specific to this project: `h_next` is evaluated on the debris' next states, because here the obstacles move during training (the paper trains with static NPCs, Sec. V-D).
+
+**Multi-step loss (optional)** — [`Trainer.unroll`](sablas_torch.py), enabled with `--horizon K`.
+With the default `K = 1` the loss is the one-step loss above. With `K > 1` the dataset stores windows of `K` consecutive real transitions and the stop-gradient construction is chained, so each state keeps the value of the real state while its gradient reaches every earlier command in the window.
+It was added because one thrust step changes the velocity by only 0.5 m/s, which gave the controller almost no gradient in a one-step look-ahead. Its effect on the collision rate has not been measured yet.
+*Paper: an extension of Eq. (7), Sec. IV-B, which is one-step only. This part is not in the paper or in the authors' code.*
 
 **Optimisation** — [`Trainer.train_cbf_and_controller`](sablas_torch.py#L265).
 One Adam step on the summed loss updates both networks; 100 such steps per update with batch size 1024.

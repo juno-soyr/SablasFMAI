@@ -110,6 +110,28 @@ def unit_checks():
     tr = S.Trainer(ag.controller, ag.cbf, ds)
     loss, acc = tr.train_cbf_and_controller(rng, batch_size=32, opt_iter=2)
     report("trainer step runs, loss finite", np.isfinite(loss), f"(loss {loss:.3f})")
+
+    # (e) multi-step loss: a window of 3 real transitions
+    K = 3
+    seq = lambda X: S.T(np.stack([X[i] for i in range(K + 1)], 1))
+    st_w, ob_w = seq(O), seq(R + O[:, :, None])
+    un_w = S.T(np.stack([E.pi_nom(O[i]) / E.U_MAX for i in range(K)], 1))
+    er_w = torch.zeros(len(st), K, 6, device=S.DEV)
+    xbar, _ = tr.unroll(st_w, ob_w, un_w, er_w)
+    val_err = (xbar - st_w[:, 1:]).abs().max().item()
+    report("multi-step: every chained state equals the real state", val_err < 1e-3, f"(max abs err {val_err:.1e})")
+    # gradient of the position two steps ahead w.r.t. the first command (probe in place of the network)
+    probe = [torch.zeros(len(st), 3, device=S.DEV, requires_grad=True) for _ in range(K)]
+    it = iter(probe)
+    net, tr.controller = tr.controller, lambda x, o, un_, e: un_ + next(it)
+    xbar, _ = tr.unroll(st_w, ob_w, un_w, er_w)
+    tr.controller = net
+    g = torch.autograd.grad(xbar[0, 1, 0], probe[0])[0][0, 0].item()
+    report("multi-step: d p[t+2] / d u[t] = dt^2 * u_max", abs(g - E.DT**2 * E.U_MAX) < 1e-3,
+           f"(got {g:.3f}, expected {E.DT**2 * E.U_MAX:.3f})")
+    ds_w = S.Dataset(); ds_w.add_windows(*(x.cpu().numpy() for x in (st_w, ob_w, un_w, er_w)))
+    loss, _ = S.Trainer(ag.controller, ag.cbf, ds_w).train_cbf_and_controller(rng, batch_size=16, opt_iter=2)
+    report("multi-step: trainer step runs, loss finite", np.isfinite(loss), f"(loss {loss:.3f})")
     if not ok:
         sys.exit("\nunit checks failed: fix before training")
 
@@ -122,6 +144,8 @@ def main():
     ap.add_argument("--ca-features", action="store_true", help="add closest-approach input features")
     ap.add_argument("--debris", type=int, default=3)
     ap.add_argument("--umax", type=float, default=0.05, help="per-axis thrust accel [m/s^2]")
+    ap.add_argument("--horizon", type=int, default=1,
+                    help="transitions per training window; 1 = one-step loss of the paper")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--test-episodes", type=int, default=500)
     ap.add_argument("--max-collision", type=float, default=0.05)
@@ -131,7 +155,7 @@ def main():
     ap.add_argument("--skip-checks", action="store_true")
     a = ap.parse_args()
 
-    name = a.name or f"deb{a.debris}_u{a.umax:g}_st{a.train_steps}_s{a.seed}{'_ca' if a.ca_features else ''}"
+    name = a.name or f"deb{a.debris}_u{a.umax:g}_st{a.train_steps}_s{a.seed}{'_ca' if a.ca_features else ''}{f'_h{a.horizon}' if a.horizon > 1 else ''}"
     out = os.path.join(HERE, "runs", name); os.makedirs(out, exist_ok=True)
     ckpt = os.path.join(out, "agent.pt")
     py = sys.executable
@@ -145,7 +169,7 @@ def main():
         smoke = os.path.join(out, "smoke.pt")
         rc = run([py, "sablas_torch.py", "--train-steps", "3000", "--n-env", "8", "--update-interval", "1000",
                   "--opt-iter", "5", "--batch", "128", "--debris", str(a.debris), "--umax", str(a.umax),
-                  "--ckpt", smoke] + (["--ca-features"] if a.ca_features else []),
+                  "--horizon", str(a.horizon), "--ckpt", smoke] + (["--ca-features"] if a.ca_features else []),
                  os.path.join(out, "smoke_train.log"))
         if rc != 0:
             sys.exit("smoke training failed, see smoke_train.log")
@@ -160,7 +184,8 @@ def main():
     if not a.verify_only:
         banner(f"4/5  training ({a.train_steps} environment steps) -> {ckpt}")
         rc = run([py, "sablas_torch.py", "--train-steps", str(a.train_steps), "--n-env", str(a.n_env),
-                  "--debris", str(a.debris), "--umax", str(a.umax), "--seed", str(a.seed), "--ckpt", ckpt]
+                  "--debris", str(a.debris), "--umax", str(a.umax), "--seed", str(a.seed),
+                  "--horizon", str(a.horizon), "--ckpt", ckpt]
                  + (["--ca-features"] if a.ca_features else []),
                  os.path.join(out, "train.log"))
         if rc != 0:

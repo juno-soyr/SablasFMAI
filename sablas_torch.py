@@ -33,6 +33,15 @@ What is adapted to this problem
   * The nominal model is the known Clohessy-Wiltshire equation instead of a learned
     control-affine network (the repo learns one by system identification first).
   * Several episodes run in parallel; data is added per environment step as in the repo.
+  * Optional multi-step loss (--horizon K, default 1 = the repo's one-step loss). One
+    thrust step only changes the velocity by u_max * dt, so a one-step look-ahead gives
+    the controller almost no gradient. With K > 1 the dataset stores windows of K
+    consecutive real transitions and the SABLAS construction is chained:
+        x_nom[j+1]  = xbar[j] + f_nom(xbar[j], pi(xbar[j])) * dt
+        xbar[j+1]   = x_nom[j+1] + (x_real[j+1] - x_nom[j+1]).detach()
+    Every xbar[j] still has the value of the real state, but its gradient now reaches
+    the commands of all earlier steps in the window. The CBF condition is applied at
+    each step j with h(x_real[j]) as the reference and h(xbar[j+1]) as the next value.
 """
 import argparse, time
 import numpy as np
@@ -178,6 +187,9 @@ class Agent(nn.Module):
 
 # ---------------------------------------------------------------- dataset (repo: modules/dataset.py)
 class Dataset:
+    """Replay buffers of windows of K consecutive real transitions (K = 1: single
+    transitions, as in the repo). One window holds
+      state (K+1, 6), obstacle (K+1, k, 6), u_nominal (K, 3), state_error (K, 6)."""
     CLASSES = ("safe", "dang", "mid")
 
     def __init__(self, buffer_size=BUFFER_SIZE):
@@ -188,11 +200,16 @@ class Dataset:
         return sum(0 if b is None else len(b[0]) for b in self.buf.values())
 
     def add_data(self, state, obstacle, u_nominal, state_next, obstacle_next, state_error):
-        """Batched: arrays with leading dim n. Labelled by distance to the nearest obstacle."""
-        dist = np.linalg.norm(obstacle[:, :, :3] - state[:, None, :3], axis=2).min(1)
+        """Single transitions, arrays with leading dim n (a window of length 1)."""
+        self.add_windows(np.stack([state, state_next], 1), np.stack([obstacle, obstacle_next], 1),
+                         np.asarray(u_nominal)[:, None], np.asarray(state_error)[:, None])
+
+    def add_windows(self, state, obstacle, u_nominal, state_error):
+        """Batched windows, leading dim n. Labelled by the distance to the nearest
+        obstacle at the first step of the window."""
+        dist = np.linalg.norm(obstacle[:, 0, :, :3] - state[:, 0, None, :3], axis=2).min(1)
         cls = np.where(dist < DANG_DIST, 1, np.where(dist > SAFE_DIST, 0, 2))
-        rows = [np.asarray(a, dtype=np.float32) for a in
-                (state, obstacle, u_nominal, state_next, obstacle_next, state_error)]
+        rows = [np.asarray(a, dtype=np.float32) for a in (state, obstacle, u_nominal, state_error)]
         for ci, c in enumerate(self.CLASSES):
             m = cls == ci
             if not m.any():
@@ -212,7 +229,7 @@ class Dataset:
         for c, n_ in zip(avail, sizes):
             idx = rng.integers(0, len(self.buf[c][0]), n_)
             parts.append([b[idx] for b in self.buf[c]])
-        return [np.concatenate([p[i] for p in parts]) for i in range(6)]
+        return [np.concatenate([p[i] for p in parts]) for i in range(4)]
 
 
 # ---------------------------------------------------------------- trainer (repo: modules/trainer.py)
@@ -234,13 +251,27 @@ class Trainer:
         dang = (dist <= DANG_DIST).float()
         return safe, dang, (1 - safe) * (1 - dang)
 
-    def compute_loss(self, state, obstacle, u_nominal, state_next, obstacle_next, state_error):
-        safe, dang, mid = self.get_mask(state, obstacle)
-        h = self.cbf(state, obstacle)
-        u = self.controller(state, obstacle, u_nominal, state_error)
-        state_next_nominal = state + nominal_dynamics(state, u) * E.DT
-        state_next_with_grad = state_next_nominal + (state_next - state_next_nominal).detach()
-        h_next = self.cbf(state_next_with_grad, obstacle_next)
+    def unroll(self, state, obstacle, u_nominal, state_error):
+        """Chain the SABLAS construction over a window of K real transitions.
+        state (bs, K+1, 6), obstacle (bs, K+1, k, 6), u_nominal (bs, K, 3), state_error (bs, K, 6).
+        Returns xbar (bs, K, 6), the states at steps 1..K with the value of the real states
+        and the gradient of the nominal model w.r.t. all earlier commands, and u (bs, K, 3)."""
+        x, xbar, us = state[:, 0], [], []
+        for j in range(u_nominal.shape[1]):
+            u = self.controller(x, obstacle[:, j], u_nominal[:, j], state_error[:, j])
+            x_nominal = x + nominal_dynamics(x, u) * E.DT
+            x = x_nominal + (state[:, j + 1] - x_nominal).detach()
+            xbar.append(x); us.append(u)
+        return torch.stack(xbar, 1), torch.stack(us, 1)
+
+    def compute_loss(self, state, obstacle, u_nominal, state_error):
+        bs, K, k = u_nominal.shape[0], u_nominal.shape[1], obstacle.shape[2]
+        state_next_with_grad, u = self.unroll(state, obstacle, u_nominal, state_error)
+        s_now, o_now = state[:, :K].reshape(bs * K, 6), obstacle[:, :K].reshape(bs * K, k, 6)
+        o_next = obstacle[:, 1:].reshape(bs * K, k, 6)
+        safe, dang, mid = self.get_mask(s_now, o_now)
+        h = self.cbf(s_now, o_now)                                  # real states, no controller gradient
+        h_next = self.cbf(state_next_with_grad.reshape(bs * K, 6), o_next)
         deriv = (h_next - h) / dt_n() + h
 
         ns, nd, nm = safe.sum(), dang.sum(), mid.sum()
@@ -279,7 +310,8 @@ class Trainer:
 # ---------------------------------------------------------------- training loop (repo: scripts/train_drone.py)
 def save(path, agent, hist):
     torch.save({"cbf": agent.cbf.state_dict(), "controller": agent.controller.state_dict(),
-                "ca_features": agent.ca, "hist": hist, "M_DEB": E.M_DEB, "U_MAX": E.U_MAX}, path)
+                "ca_features": agent.ca, "hist": hist, "M_DEB": E.M_DEB, "U_MAX": E.U_MAX,
+                "horizon": getattr(agent, "horizon", 1)}, path)
 
 
 def load(path):
@@ -291,12 +323,15 @@ def load(path):
 
 
 def train(train_steps=1_000_000, n_env=32, update_interval=5000, opt_iter=100, batch=1024,
-          seed=0, ckpt="sablas_torch_agent.pt", ca_features=False, lr_decay_stepsize=-1):
+          seed=0, ckpt="sablas_torch_agent.pt", ca_features=False, lr_decay_stepsize=-1, horizon=1):
     """train_steps and update_interval count environment steps (one spacecraft, one
-    control period), as config.TRAIN_STEPS / POLICY_UPDATE_INTERVAL in the repo."""
+    control period), as config.TRAIN_STEPS / POLICY_UPDATE_INTERVAL in the repo.
+    horizon: number of consecutive transitions per training window (1 = one-step loss)."""
     rng = np.random.default_rng(seed); torch.manual_seed(seed)
     agent = Agent(ca_features).to(DEV)
+    agent.horizon = horizon
     dataset = Dataset()
+    win = {k_: [] for k_ in ("state", "obstacle", "u_nominal", "state_error")}   # last `horizon` steps
     trainer = Trainer(agent.controller, agent.cbf, dataset, lr_decay_stepsize=lr_decay_stepsize)
 
     ep = E.Episodes(n_env, rng)
@@ -315,7 +350,12 @@ def train(train_steps=1_000_000, n_env=32, update_interval=5000, opt_iter=100, b
         u_cmd = u_n * E.U_MAX
         ep.step(np.clip(u_cmd, -E.U_MAX, E.U_MAX))                 # black box, thruster saturates
         own2, rel2 = ep.observe()
-        dataset.add_data(own, obstacle, u_nom, own2, rel2 + own2[:, None], err)
+        for k_, v in zip(win, (own, obstacle, u_nom, err)):
+            win[k_] = (win[k_] + [v])[-horizon:]
+        if len(win["state"]) == horizon:                           # windows never cross an episode reset
+            dataset.add_windows(np.stack(win["state"] + [own2], 1),
+                                np.stack(win["obstacle"] + [rel2 + own2[:, None]], 1),
+                                np.stack(win["u_nominal"], 1), np.stack(win["state_error"], 1))
         err = (own2 - E.cw_step(own, u_cmd)) / dt_n()              # nominal-model error -> next input
         min_d = np.minimum(min_d, np.linalg.norm(rel2[..., :3], axis=-1).min(1))
         t += 1; env_steps += n_env
@@ -324,6 +364,7 @@ def train(train_steps=1_000_000, n_env=32, update_interval=5000, opt_iter=100, b
             collisions.extend((min_d < DANG_DIST).tolist())
             ep = E.Episodes(n_env, rng)
             err[:] = 0; min_d[:] = np.inf; t = 0
+            win = {k_: [] for k_ in win}
 
         if env_steps >= next_update:
             next_update += update_interval
@@ -351,10 +392,12 @@ if __name__ == "__main__":
     ap.add_argument("--umax", type=float, default=E.U_MAX)
     ap.add_argument("--ca-features", action="store_true", help="add miss distance / time to closest approach")
     ap.add_argument("--lr-decay", type=int, default=-1, help="halve lr every N updates (-1: off, as in repo)")
+    ap.add_argument("--horizon", type=int, default=1,
+                    help="transitions per training window; 1 = one-step loss of the paper")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ckpt", default="sablas_torch_agent.pt")
     a = ap.parse_args()
     E.M_DEB, E.U_MAX = a.debris, a.umax
-    print(f"device {DEV} | debris {E.M_DEB} | u_max {E.U_MAX} | train steps {a.train_steps} | ckpt {a.ckpt}", flush=True)
+    print(f"device {DEV} | debris {E.M_DEB} | u_max {E.U_MAX} | horizon {a.horizon} | train steps {a.train_steps} | ckpt {a.ckpt}", flush=True)
     train(a.train_steps, a.n_env, a.update_interval, a.opt_iter, a.batch, a.seed, a.ckpt,
-          a.ca_features, a.lr_decay)
+          a.ca_features, a.lr_decay, a.horizon)
