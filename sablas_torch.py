@@ -50,7 +50,7 @@ from torch import nn
 import cw_env as E
 
 TIME_UNIT = 100.0            # s per time unit -> dt = 0.1
-SAFE_DIST = 3000.0           # m, repo: safe_dist = 1.0 (chosen so a dodge is still possible)
+SAFE_DIST = 5000.0           # m, repo: safe_dist = 1.0 (chosen so a dodge is still possible) // TESTING INCREASE 3000 -> 5000
 DANG_DIST = E.D_SAFE         # m, repo: dang_dist = 0.6
 EPS, EPS_DERIV, EPS_ACTION = 0.1, 0.03, 0.2
 ACTION_LOSS_WEIGHT = 0.08
@@ -60,7 +60,7 @@ POS_SCALE, VEL_SCALE, T_SCALE = 1000.0, 10.0, 300.0
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float32
-A_CW = torch.tensor(E.A_CW, dtype=DTYPE, device=DEV)
+A_CW = torch.tensor(E.A_CW, dtype=DTYPE, device=DEV) # Clovety-Whiltshire matrix, s_dot = A s + B u [per second]
 
 
 def dt_n():
@@ -94,27 +94,53 @@ def preprocess_diff(diff, ca_features):
 
 
 # ---------------------------------------------------------------- networks (repo: modules/network.py)
+CBF_ACTIVATIONS = {"relu": nn.ReLU, "silu": nn.SiLU, "softplus": nn.Softplus, "tanh": nn.Tanh}
+PRIOR_DIST = 0.5 * (SAFE_DIST + DANG_DIST)   # m, zero level of the distance prior
+
+
 class CBF(nn.Module):
-    def __init__(self, ca_features=False):
+    """Per-obstacle barrier h_k(state - obstacle_k).
+
+    activation: "silu" (default, smooth), "softplus", "tanh", or "relu" (repo). A smooth h
+        has a continuous gradient w.r.t. the state, which is what the controller learns
+        from (d h / d x * d x / d u) and what a runtime CBF filter would linearise.
+    prior: if True, h = (|p| - PRIOR_DIST) / POS_SCALE + g(x). The distance term already
+        separates the labelled sets (-/+ (SAFE_DIST - DANG_DIST) / 2 / POS_SCALE at
+        DANG_DIST / SAFE_DIST, beyond the eps = 0.1 margins), so the network g only learns the
+        correction for relative velocity. g also gets range and range-rate as inputs,
+        and its last layer starts at zero so training begins from the plain distance
+        barrier."""
+
+    def __init__(self, ca_features=False, activation="silu", prior=False):
         super().__init__()
-        self.ca = ca_features
-        n_in = 8 if ca_features else 6
+        self.ca, self.prior = ca_features, prior
+        n_in = (8 if ca_features else 6) + (2 if prior else 0)
         self.conv0 = nn.Conv1d(n_in, 64, 1)
         self.conv1 = nn.Conv1d(64, 128, 1)
         self.conv2 = nn.Conv1d(128, 128, 1)
         self.conv3 = nn.Conv1d(128, 128, 1)
         self.conv4 = nn.Conv1d(128, 1, 1)
-        self.activation = nn.ReLU()
+        self.activation = CBF_ACTIVATIONS[activation]()
+        if prior:
+            nn.init.zeros_(self.conv4.weight); nn.init.zeros_(self.conv4.bias)
 
     def forward(self, state, obstacle):
         """state (bs, 6), obstacle (bs, k, 6) -> h (bs, k)"""
         diff = state.unsqueeze(2) - obstacle.permute(0, 2, 1)
         x = preprocess_diff(diff, self.ca)
+        if self.prior:
+            p, v = diff[:, :3], diff[:, 3:]
+            rng = (p * p).sum(1, keepdim=True).add(1e-6).sqrt()        # (bs, 1, k) [m]
+            rdot = (p * v).sum(1, keepdim=True) / rng                    # [m/s], < 0 closing
+            x = torch.cat([x, rng / POS_SCALE, rdot / VEL_SCALE], dim=1)
         x = self.activation(self.conv0(x))
         x = self.activation(self.conv1(x))
         x = self.activation(self.conv2(x))
         x = self.activation(self.conv3(x))
-        return self.conv4(x).squeeze(1)
+        h = self.conv4(x).squeeze(1)
+        if self.prior:
+            h = h + ((rng.squeeze(1) - PRIOR_DIST) / POS_SCALE)
+        return h
 
 
 class NNController(nn.Module):
@@ -155,10 +181,10 @@ def nominal_dynamics(state, u_n):
 
 
 class Agent(nn.Module):
-    def __init__(self, ca_features=False):
+    def __init__(self, ca_features=False, cbf_act="silu", cbf_prior=False):
         super().__init__()
-        self.ca = ca_features
-        self.cbf = CBF(ca_features)
+        self.ca, self.cbf_act, self.cbf_prior = ca_features, cbf_act, cbf_prior
+        self.cbf = CBF(ca_features, cbf_act, cbf_prior)
         self.controller = NNController(ca_features=ca_features)
 
     def h_all(self, own, rel):
@@ -310,25 +336,26 @@ class Trainer:
 # ---------------------------------------------------------------- training loop (repo: scripts/train_drone.py)
 def save(path, agent, hist):
     torch.save({"cbf": agent.cbf.state_dict(), "controller": agent.controller.state_dict(),
-                "ca_features": agent.ca, "hist": hist, "M_DEB": E.M_DEB, "U_MAX": E.U_MAX,
+                "ca_features": agent.ca, "cbf_act": agent.cbf_act, "cbf_prior": agent.cbf_prior, "hist": hist, "M_DEB": E.M_DEB, "U_MAX": E.U_MAX,
                 "horizon": getattr(agent, "horizon", 1)}, path)
 
 
 def load(path):
     ck = torch.load(path, map_location=DEV)
     E.M_DEB, E.U_MAX = ck["M_DEB"], ck["U_MAX"]
-    ag = Agent(ck["ca_features"]).to(DEV)
+    ag = Agent(ck["ca_features"], ck.get("cbf_act", "relu"), ck.get("cbf_prior", False)).to(DEV)
     ag.cbf.load_state_dict(ck["cbf"]); ag.controller.load_state_dict(ck["controller"]); ag.eval()
     return ag, ck["hist"]
 
 
 def train(train_steps=1_000_000, n_env=32, update_interval=5000, opt_iter=100, batch=1024,
-          seed=0, ckpt="sablas_torch_agent.pt", ca_features=False, lr_decay_stepsize=-1, horizon=1):
+          seed=0, ckpt="sablas_torch_agent.pt", ca_features=False, lr_decay_stepsize=-1, horizon=1,
+          cbf_act="silu", cbf_prior=False):
     """train_steps and update_interval count environment steps (one spacecraft, one
     control period), as config.TRAIN_STEPS / POLICY_UPDATE_INTERVAL in the repo.
     horizon: number of consecutive transitions per training window (1 = one-step loss)."""
     rng = np.random.default_rng(seed); torch.manual_seed(seed)
-    agent = Agent(ca_features).to(DEV)
+    agent = Agent(ca_features, cbf_act, cbf_prior).to(DEV)
     agent.horizon = horizon
     dataset = Dataset()
     win = {k_: [] for k_ in ("state", "obstacle", "u_nominal", "state_error")}   # last `horizon` steps
@@ -394,10 +421,14 @@ if __name__ == "__main__":
     ap.add_argument("--lr-decay", type=int, default=-1, help="halve lr every N updates (-1: off, as in repo)")
     ap.add_argument("--horizon", type=int, default=1,
                     help="transitions per training window; 1 = one-step loss of the paper")
+    ap.add_argument("--cbf-act", default="silu", choices=list(CBF_ACTIVATIONS),
+                    help="CBF hidden activation (repo: relu)")
+    ap.add_argument("--cbf-prior", action="store_true",
+                    help="h = distance prior + learned residual with range / range-rate inputs")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ckpt", default="sablas_torch_agent.pt")
     a = ap.parse_args()
     E.M_DEB, E.U_MAX = a.debris, a.umax
-    print(f"device {DEV} | debris {E.M_DEB} | u_max {E.U_MAX} | horizon {a.horizon} | train steps {a.train_steps} | ckpt {a.ckpt}", flush=True)
+    print(f"device {DEV} | debris {E.M_DEB} | u_max {E.U_MAX} | horizon {a.horizon} | cbf {a.cbf_act}{'+prior' if a.cbf_prior else ''} | train steps {a.train_steps} | ckpt {a.ckpt}", flush=True)
     train(a.train_steps, a.n_env, a.update_interval, a.opt_iter, a.batch, a.seed, a.ckpt,
-          a.ca_features, a.lr_decay, a.horizon)
+          a.ca_features, a.lr_decay, a.horizon, a.cbf_act, a.cbf_prior)

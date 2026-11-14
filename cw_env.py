@@ -26,7 +26,7 @@ DT = 10.0                                # control period [s]
 N_SUB = 2
 STEPS = 120                              # 20 min episodes
 M_DEB = 3                                # debris pieces per episode
-D_SAFE = 300.0                           # keep-out radius [m]
+D_SAFE = 2500.0                           # keep-out radius [m]
 U_MAX = 0.05                             # per-axis thrust accel [m/s^2]
 
 ETA, MIS_DEG, NOISE = 0.80, 6.0, 0.03

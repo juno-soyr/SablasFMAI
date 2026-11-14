@@ -146,6 +146,9 @@ def main():
     ap.add_argument("--umax", type=float, default=0.05, help="per-axis thrust accel [m/s^2]")
     ap.add_argument("--horizon", type=int, default=1,
                     help="transitions per training window; 1 = one-step loss of the paper")
+    ap.add_argument("--cbf-act", default="silu", choices=["relu", "silu", "softplus", "tanh"],
+                    help="CBF hidden activation (repo: relu)")
+    ap.add_argument("--cbf-prior", action="store_true", help="distance prior + learned residual in the CBF")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--test-episodes", type=int, default=500)
     ap.add_argument("--max-collision", type=float, default=0.05)
@@ -155,10 +158,11 @@ def main():
     ap.add_argument("--skip-checks", action="store_true")
     a = ap.parse_args()
 
-    name = a.name or f"deb{a.debris}_u{a.umax:g}_st{a.train_steps}_s{a.seed}{'_ca' if a.ca_features else ''}{f'_h{a.horizon}' if a.horizon > 1 else ''}"
+    name = a.name or f"deb{a.debris}_u{a.umax:g}_st{a.train_steps}_s{a.seed}{'_ca' if a.ca_features else ''}{f'_h{a.horizon}' if a.horizon > 1 else ''}{f'_{a.cbf_act}' if a.cbf_act != 'silu' else ''}{'_prior' if a.cbf_prior else ''}"
     out = os.path.join(HERE, "runs", name); os.makedirs(out, exist_ok=True)
     ckpt = os.path.join(out, "agent.pt")
     py = sys.executable
+    cbf_args = ["--cbf-act", a.cbf_act] + (["--cbf-prior"] if a.cbf_prior else [])
     t0 = time.time()
 
     check_env()
@@ -169,7 +173,7 @@ def main():
         smoke = os.path.join(out, "smoke.pt")
         rc = run([py, "sablas_torch.py", "--train-steps", "3000", "--n-env", "8", "--update-interval", "1000",
                   "--opt-iter", "5", "--batch", "128", "--debris", str(a.debris), "--umax", str(a.umax),
-                  "--horizon", str(a.horizon), "--ckpt", smoke] + (["--ca-features"] if a.ca_features else []),
+                  "--horizon", str(a.horizon), "--ckpt", smoke] + (["--ca-features"] if a.ca_features else []) + cbf_args,
                  os.path.join(out, "smoke_train.log"))
         if rc != 0:
             sys.exit("smoke training failed, see smoke_train.log")
@@ -186,7 +190,7 @@ def main():
         rc = run([py, "sablas_torch.py", "--train-steps", str(a.train_steps), "--n-env", str(a.n_env),
                   "--debris", str(a.debris), "--umax", str(a.umax), "--seed", str(a.seed),
                   "--horizon", str(a.horizon), "--ckpt", ckpt]
-                 + (["--ca-features"] if a.ca_features else []),
+                 + (["--ca-features"] if a.ca_features else []) + cbf_args,
                  os.path.join(out, "train.log"))
         if rc != 0:
             sys.exit("training failed, see train.log")
