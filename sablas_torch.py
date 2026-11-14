@@ -118,7 +118,7 @@ class CBF(nn.Module):
 
 
 class NNController(nn.Module):
-    def __init__(self, m_control=3, ca_features=False, output_scale=1.0):
+    def __init__(self, m_control=3, ca_features=False, output_scale=2.0):
         super().__init__()
         self.ca = ca_features
         n_in = 8 if ca_features else 6
