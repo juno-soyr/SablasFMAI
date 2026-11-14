@@ -73,6 +73,13 @@ States are reported in the rotating frame of the slot: the spacecraft's own stat
 A shared MLP applied to each `state − obstacle` difference, giving one value `h` per debris piece. The state is safe when every `h` is non-negative.
 *Paper: the neural CBF `h(s; Ω)` of Sec. III-B and III-C. Sec. V-D gives the architecture only by reference to Sec. 4.2 of its ref. [17]; the layer sizes come from the authors' code (`modules/network.py`).*
 
+Two changes from the authors' network, both in the `CBF` class:
+
+- **Smooth activation** (`--cbf-act`, default `silu`; `relu` gives the authors' network). The CBF conditions assume `h` is continuously differentiable, and the controller learns from `∂h/∂s · ∂s/∂u`. With ReLU that gradient changes abruptly between regions; with SiLU it is continuous. A smooth `h` is also needed to linearise the barrier in a runtime safety filter. Background: Ames et al. 2019 [[A1]](#references), Robey et al. 2020 [[A2]](#references), Dawson et al. 2023 [[A3]](#references); a neural barrier used inside a gradient-based controller, Dawson et al. 2021 [[A4]](#references); SiLU from [[A5]](#references), [[A6]](#references).
+- **Distance prior with a learned residual** (`--cbf-prior`, off by default). `h = (‖p‖ − d₀) / 1 km + g(x)`, where `d₀` is halfway between `DANG_DIST` and `SAFE_DIST`. The distance term alone already gives `h < 0` on dangerous and `h > 0` on safe samples. The network `g` also receives range and range-rate as inputs, and its last layer starts at zero, so training starts from a plain distance barrier and `g` only learns the correction for approach speed. `g` is not bounded: a distance barrier on its own is not a valid CBF when the thrust is too weak to stop a fast approach in time, so `g` has to be able to lower `h` earlier. Background: residual learning on top of a known model, Johannink et al. 2019 [[A7]](#references) and Silver et al. 2018 [[A8]](#references); known safety structure combined with a learned component, Cheng et al. 2019 [[A9]](#references).
+
+Checkpoints store both settings. Checkpoints saved before these options existed load as `relu` without the prior.
+
 **Controller** — [`NNController`](sablas_torch.py#L111).
 Encodes each debris piece with a shared MLP, max-pools over the pieces so the order does not matter, then combines the result with the nominal command and outputs a bounded correction that is added to it.
 *Paper: the neural controller `π(s; Θ)` of Sec. III-C, with observed obstacles as inputs as in Sec. V-D. The residual form and the `state_error` input (how far the last real step landed from the nominal prediction) are from the authors' code, not from the paper's text.*
@@ -166,3 +173,24 @@ The pipeline itself has no counterpart in the paper.
 | Layer sizes, max-pooling, residual output, `state_error` input | Authors' code, `modules/network.py` |
 | Replay buffers, the middle class, loss margins, λ = 0.08, controller learning rate | Authors' code, `modules/dataset.py` and `modules/trainer.py` |
 | Time unit of 100 s, input scaling, moving obstacles in `h_next`, parallel episodes | Adaptations for this problem, listed in the docstring of [sablas_torch.py](sablas_torch.py) |
+| SiLU activation and optional distance prior in the CBF | Additions for this project, see [Barrier function](#sablas_torchpy-the-learner) |
+
+## References
+
+The method:
+
+- [S1] Z. Qin, D. Sun, C. Fan, *SABLAS: Learning Safe Control for Black-box Dynamical Systems*, IEEE RA-L 2022. [arXiv:2201.01918](https://arxiv.org/abs/2201.01918)
+- [S2] Z. Qin, K. Zhang, Y. Chen, J. Chen, C. Fan, *Learning Safe Multi-Agent Control with Decentralized Neural Barrier Certificates*, ICLR 2021. [arXiv:2101.05436](https://arxiv.org/abs/2101.05436). The per-obstacle barrier and shared encoder.
+- [S3] C. Qi, H. Su, K. Mo, L. Guibas, *PointNet*, CVPR 2017, [paper](https://openaccess.thecvf.com/content_cvpr_2017/papers/Qi_PointNet_Deep_Learning_CVPR_2017_paper.pdf); M. Zaheer et al., *Deep Sets*, NeurIPS 2017, [arXiv:1703.06114](https://arxiv.org/abs/1703.06114). A shared MLP per element with max-pooling, as used by the controller.
+
+Background for the CBF changes:
+
+- [A1] A. Ames, S. Coogan, M. Egerstedt, G. Notomista, K. Sreenath, P. Tabuada, *Control Barrier Functions: Theory and Applications*, ECC 2019. [arXiv:1903.11199](https://arxiv.org/abs/1903.11199)
+- [A2] A. Robey et al., *Learning Control Barrier Functions from Expert Demonstrations*, CDC 2020. [arXiv:2004.03315](https://arxiv.org/abs/2004.03315)
+- [A3] C. Dawson, S. Gao, C. Fan, *Safe Control with Learned Certificates: A Survey of Neural Lyapunov, Barrier, and Contraction Methods*, IEEE T-RO 2023. [arXiv:2202.11762](https://arxiv.org/abs/2202.11762)
+- [A4] C. Dawson, Z. Qin, S. Gao, C. Fan, *Safe Nonlinear Control Using Robust Neural Lyapunov-Barrier Functions*, CoRL 2021. [PMLR](https://proceedings.mlr.press/v164/dawson22a.html), [code](https://github.com/dawsonc/neural_clbf/)
+- [A5] D. Hendrycks, K. Gimpel, *Gaussian Error Linear Units (GELUs)*, 2016. [arXiv:1606.08415](https://arxiv.org/abs/1606.08415). Introduces x·σ(x) (SiLU) as a variant.
+- [A6] S. Elfwing, E. Uchibe, K. Doya, *Sigmoid-Weighted Linear Units for Neural Network Function Approximation in Reinforcement Learning*, 2017. [arXiv:1702.03118](https://arxiv.org/abs/1702.03118)
+- [A7] T. Johannink et al., *Residual Reinforcement Learning for Robot Control*, ICRA 2019. [arXiv:1812.03201](https://arxiv.org/abs/1812.03201)
+- [A8] T. Silver, K. Allen, J. Tenenbaum, L. Kaelbling, *Residual Policy Learning*, 2018. [arXiv:1812.06298](https://arxiv.org/abs/1812.06298)
+- [A9] R. Cheng, G. Orosz, R. Murray, J. Burdick, *End-to-End Safe Reinforcement Learning through Barrier Functions for Safety-Critical Continuous Control Tasks*, AAAI 2019. [paper](https://ojs.aaai.org/index.php/AAAI/article/view/4213)

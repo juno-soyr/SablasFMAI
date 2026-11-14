@@ -33,6 +33,9 @@ What is adapted to this problem
   * The nominal model is the known Clohessy-Wiltshire equation instead of a learned
     control-affine network (the repo learns one by system identification first).
   * Several episodes run in parallel; data is added per environment step as in the repo.
+  * CBF activation is SiLU by default (--cbf-act relu gives the repo's network), so h
+    has a continuous gradient. Optional --cbf-prior: h = distance prior + learned
+    residual with range / range-rate inputs. See the CBF class and README references.
   * Optional multi-step loss (--horizon K, default 1 = the repo's one-step loss). One
     thrust step only changes the velocity by u_max * dt, so a one-step look-ahead gives
     the controller almost no gradient. With K > 1 the dataset stores windows of K
