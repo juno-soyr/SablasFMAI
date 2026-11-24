@@ -19,32 +19,34 @@ What is taken from the repo as-is
     deriv = (h(x_next_with_grad) - h(x)) / dt + h(x),
     x_next_with_grad = x_nom + (x_next - x_nom).detach(),
     action loss mean(relu(|u - u_nom| - eps_action)) * 0.08.
-    eps 0.1, eps_deriv 0.03, eps_action 0.2.
+    eps 0.1, eps_deriv 0.03.
   * Adam: controller lr 5e-4, CBF lr 1e-4, weight decay 1e-5; one joint step on the sum.
   * Online data collection; every 5000 environment steps, 100 updates with batch 1024.
 
 What is adapted to this problem
   * Time is measured in units of 100 s, so the control step is dt = 0.1 exactly as in
-    the repo, and alpha = 1 means 0.01 /s. The eps values then carry over unchanged.
-  * Obstacles move, so h_next uses the obstacles' next states (the repo's obstacles
-    are static and it reuses the current ones).
-  * Inputs are scaled (positions / 1 km, velocities / 10 m/s) by the preprocess hook the
-    repo provides; the control is normalised by u_max; the real thruster saturates.
-  * The nominal model is the known Clohessy-Wiltshire equation instead of a learned
-    control-affine network (the repo learns one by system identification first).
+    the repo, and alpha = 1 means 0.01 /s.
+  * Obstacles move, so h_next uses the obstacles' next states.
+  * Inputs are scaled (positions / 1 km, velocities / 10 m/s); the control is normalised
+    by u_max; the real thruster saturates.
+  * The nominal model is the known Clohessy-Wiltshire equation.
   * Several episodes run in parallel; data is added per environment step as in the repo.
-  * CBF activation is SiLU by default (--cbf-act relu gives the repo's network), so h
-    has a continuous gradient. Optional --cbf-prior: h = distance prior + learned
-    residual with range / range-rate inputs. See the CBF class and README references.
-  * Optional multi-step loss (--horizon K, default 1 = the repo's one-step loss). One
-    thrust step only changes the velocity by u_max * dt, so a one-step look-ahead gives
-    the controller almost no gradient. With K > 1 the dataset stores windows of K
-    consecutive real transitions and the SABLAS construction is chained:
-        x_nom[j+1]  = xbar[j] + f_nom(xbar[j], pi(xbar[j])) * dt
-        xbar[j+1]   = x_nom[j+1] + (x_real[j+1] - x_nom[j+1]).detach()
-    Every xbar[j] still has the value of the real state, but its gradient now reaches
-    the commands of all earlier steps in the window. The CBF condition is applied at
-    each step j with h(x_real[j]) as the reference and h(xbar[j+1]) as the next value.
+  * CBF activation is SiLU by default (--cbf-act relu gives the repo's network).
+    Optional --cbf-prior: h = distance prior + learned residual.
+  * Optional multi-step loss (--horizon K, default 1 = the repo's one-step loss); the
+    SABLAS construction is chained over K real transitions.
+
+Changes in this revision
+  * The nominal model sees the *saturated* command (|u| <= 1), in the training unroll,
+    in state_error (training and policy) and in the collection loop. No gradient flows
+    through a saturated thruster.
+  * EPS_ACTION raised to 1.0 (a residual of one full u_max is free) so the action loss
+    no longer pulls the controller back to the slot-holding nominal law; configurable.
+  * Exploration noise on the command while collecting data (--explore-noise).
+  * state_error is multiplied by ERR_GAIN so the (tiny) model-mismatch signal is usable.
+  * Collision count during training uses the interpolated minimum distance.
+  * Optional run-time safety shield (Agent.make_policy(shield=True)): a minimum-
+    intervention filter that enforces the learned CBF condition on the command.
 """
 import argparse, time
 import numpy as np
@@ -53,17 +55,22 @@ from torch import nn
 import cw_env as E
 
 TIME_UNIT = 100.0            # s per time unit -> dt = 0.1
-SAFE_DIST = 5000.0           # m, repo: safe_dist = 1.0 (chosen so a dodge is still possible) // TESTING INCREASE 3000 -> 5000
+# m. Largest head-on debris speed that can still be dodged from this range with full
+# thrust is ~18.6 m/s at 5000 m (11 m/s at 3000 m), so labels "safe" stay recoverable.
+SAFE_DIST = 5000.0
 DANG_DIST = E.D_SAFE         # m, repo: dang_dist = 0.6
-EPS, EPS_DERIV, EPS_ACTION = 0.1, 0.03, 0.2
+EPS, EPS_DERIV = 0.1, 0.03
+EPS_ACTION = 1.0             # normalised by u_max (repo: 0.2 on its own scaling)
 ACTION_LOSS_WEIGHT = 0.08
+EXPLORE_NOISE = 0.1          # std of command noise (normalised) while collecting data
+ERR_GAIN = 100.0             # scale of the state_error input
 LR_CTRL, LR_CBF, WEIGHT_DECAY = 5e-4, 1e-4, 1e-5
 BUFFER_SIZE = 10000
 POS_SCALE, VEL_SCALE, T_SCALE = 1000.0, 10.0, 300.0
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float32
-A_CW = torch.tensor(E.A_CW, dtype=DTYPE, device=DEV) # Clovety-Whiltshire matrix, s_dot = A s + B u [per second]
+A_CW = torch.tensor(E.A_CW, dtype=DTYPE, device=DEV)   # Clohessy-Wiltshire matrix, s_dot = A s + B u [per second]
 
 
 def dt_n():
@@ -72,6 +79,7 @@ def dt_n():
 
 
 def T(x):
+    """Array-like -> float32 tensor on the active device."""
     return torch.as_tensor(np.asarray(x), dtype=DTYPE, device=DEV)
 
 
@@ -106,7 +114,7 @@ class CBF(nn.Module):
 
     activation: "silu" (default, smooth), "softplus", "tanh", or "relu" (repo). A smooth h
         has a continuous gradient w.r.t. the state, which is what the controller learns
-        from (d h / d x * d x / d u) and what a runtime CBF filter would linearise.
+        from (d h / d x * d x / d u) and what the run-time shield linearises.
     prior: if True, h = (|p| - PRIOR_DIST) / POS_SCALE + g(x). The distance term already
         separates the labelled sets (-/+ (SAFE_DIST - DANG_DIST) / 2 / POS_SCALE at
         DANG_DIST / SAFE_DIST, beyond the eps = 0.1 margins), so the network g only learns the
@@ -147,6 +155,10 @@ class CBF(nn.Module):
 
 
 class NNController(nn.Module):
+    """Residual controller: u = u_nominal + tanh(net(obstacles, u_nominal, state_error)) * scale.
+    Order-invariant in the obstacles (max-pool). Output normalised by u_max, NOT clipped
+    (the thruster saturates at |u| = 1, applied by the caller)."""
+
     def __init__(self, m_control=3, ca_features=False, output_scale=2.0):
         super().__init__()
         self.ca = ca_features
@@ -170,7 +182,7 @@ class NNController(nn.Module):
         x = self.activation(self.conv1(x))
         x = self.activation(self.conv2(x))
         x, _ = torch.max(x, dim=2)
-        x = torch.cat([x, u_nominal, scale_state(state_error)], dim=1)
+        x = torch.cat([x, u_nominal, scale_state(state_error) * ERR_GAIN], dim=1)
         x = self.activation(self.fc0(x))
         x = self.activation(self.fc1(x))
         x = self.output_activation(self.fc2(x)) * self.output_scale
@@ -183,7 +195,35 @@ def nominal_dynamics(state, u_n):
     return torch.cat([ds[:, :3], ds[:, 3:] + u_n * E.U_MAX], dim=1)
 
 
+# ---------------------------------------------------------------- run-time shield
+def qp_filter(u0, A, b, lo=-1.0, hi=1.0, iters=100, tol=1e-4):
+    """Minimum-intervention filter, batched, numpy:
+        min_u |u - u0|^2   s.t.   A u >= b,   lo <= u <= hi
+    u0 (n, 3), A (n, k, 3), b (n, k). Solved by Dykstra's alternating projections onto the
+    k half-spaces and the box (exact for feasible problems as iters grows).
+    Returns u (n, 3), always inside the box, and feasible (n,) bool: True where every
+    half-space holds to within tol. When infeasible, u is a best effort."""
+    n, k, _ = A.shape
+    x = np.clip(u0, lo, hi).copy()
+    p = np.zeros((k + 1, n, 3))
+    nrm2 = np.sum(A * A, axis=2)                                     # (n, k)
+    for _ in range(iters):
+        for i in range(k):
+            y = x + p[i]
+            viol = b[:, i] - np.sum(A[:, i] * y, axis=1)
+            step = np.where((viol > 0) & (nrm2[:, i] > 1e-12), viol / np.maximum(nrm2[:, i], 1e-12), 0.0)
+            xn = y + step[:, None] * A[:, i]
+            p[i] = y - xn; x = xn
+        y = x + p[k]
+        xn = np.clip(y, lo, hi)
+        p[k] = y - xn; x = xn
+    slack = np.einsum('nkj,nj->nk', A, x) - b
+    return x, slack.min(axis=1) >= -tol
+
+
 class Agent(nn.Module):
+    """CBF + controller pair."""
+
     def __init__(self, ca_features=False, cbf_act="silu", cbf_prior=False):
         super().__init__()
         self.ca, self.cbf_act, self.cbf_prior = ca_features, cbf_act, cbf_prior
@@ -191,26 +231,63 @@ class Agent(nn.Module):
         self.controller = NNController(ca_features=ca_features)
 
     def h_all(self, own, rel):
+        """Per-obstacle barrier values (bs, k) from own (bs, 6) and debris-minus-spacecraft rel (bs, k, 6)."""
         return self.cbf(own, rel + own[:, None])
 
     def h(self, own, rel):
+        """Barrier of the whole set: the minimum over obstacles (bs,)."""
         return self.h_all(own, rel).min(dim=1).values
 
-    def make_policy(self):
-        """Policy for cw_env.rollout(own, rel) -> u [m/s^2]. Keeps the previous state
-        and command to compute state_error, as in the repo; use a fresh one per rollout."""
-        mem = {}
+    def _shield(self, own, rel, u0, eps, gain_margin, iters):
+        """Enforce (h_next - h)/dt + h >= eps for every obstacle on the command u0
+        (normalised, already in the box). h_next is linearised around u0 through the CW
+        model and the predicted (uncontrolled CW) debris motion; the thrust gain in the
+        linearisation is scaled by gain_margin (< 1) because the real thruster is weaker
+        than the nominal model. Returns the filtered command, a feasibility flag, and
+        whether the filter changed the command."""
+        obs = rel + own[:, None]
+        o_next = T(E.cw_step(obs, np.zeros(obs.shape[:2] + (3,))))
+        x, o = T(own), T(obs)
+        with torch.enable_grad():
+            u = T(u0).requires_grad_(True)
+            x_next = x + nominal_dynamics(x, u) * E.DT
+            h_next = self.cbf(x_next, o_next)                                  # (n, k)
+            J = torch.stack([torch.autograd.grad(h_next[:, k].sum(), u, retain_graph=True)[0]
+                             for k in range(h_next.shape[1])], dim=1)          # (n, k, 3)
+        with torch.no_grad():
+            h = self.cbf(x, o)
+        h, h_next, J = (a.detach().cpu().numpy().astype(np.float64) for a in (h, h_next, J))
+        A = gain_margin * J
+        rhs = (1.0 - dt_n()) * h + dt_n() * eps
+        b = rhs - h_next + np.einsum('nkj,nj->nk', A, u0)
+        u_f, feasible = qp_filter(u0, A, b, iters=iters)
+        return u_f, feasible, np.abs(u_f - u0).max(axis=1) > 1e-6
 
-        @torch.no_grad()
+    def make_policy(self, shield=False, shield_eps=0.0, gain_margin=0.7, iters=100):
+        """Policy for cw_env.rollout(own, rel) -> u [m/s^2]. Keeps the previous state
+        and the previous (saturated, shielded) command to compute state_error, as in the
+        repo; use a fresh one per rollout. With shield=True the learned CBF condition is
+        enforced on the command at run time; policy.stats counts steps, interventions and
+        infeasible steps (where the filter could only do its best)."""
+        mem = {}
+        stats = dict(steps=0, active=0, infeasible=0)
+
         def policy(own, rel):
             if "own" in mem and len(mem["own"]) == len(own):
                 err = (own - E.cw_step(mem["own"], mem["u"])) / dt_n()
             else:
                 err = np.zeros_like(own)
             u_nom = E.pi_nom(own) / E.U_MAX
-            u_n = self.controller(T(own), T(rel + own[:, None]), T(u_nom), T(err)).cpu().numpy().astype(np.float64)
+            with torch.no_grad():
+                u_n = self.controller(T(own), T(rel + own[:, None]), T(u_nom), T(err)).cpu().numpy().astype(np.float64)
+            u_n = np.clip(u_n, -1.0, 1.0)                                   # thruster saturation
+            stats["steps"] += len(own)
+            if shield:
+                u_n, feasible, active = self._shield(own, rel, u_n, shield_eps, gain_margin, iters)
+                stats["active"] += int(active.sum()); stats["infeasible"] += int((~feasible).sum())
             mem["own"], mem["u"] = own.copy(), u_n * E.U_MAX
-            return np.clip(u_n * E.U_MAX, -E.U_MAX, E.U_MAX)
+            return u_n * E.U_MAX
+        policy.stats = stats
         return policy
 
 
@@ -263,11 +340,14 @@ class Dataset:
 
 # ---------------------------------------------------------------- trainer (repo: modules/trainer.py)
 class Trainer:
-    def __init__(self, controller, cbf, dataset, action_loss_weight=ACTION_LOSS_WEIGHT, lr_decay_stepsize=-1):
+    """Joint CBF + controller trainer (one Adam step on the summed SABLAS losses)."""
+
+    def __init__(self, controller, cbf, dataset, action_loss_weight=ACTION_LOSS_WEIGHT,
+                 lr_decay_stepsize=-1, eps_action=EPS_ACTION):
         self.controller, self.cbf, self.dataset = controller, cbf, dataset
         self.controller_optimizer = torch.optim.Adam(controller.parameters(), lr=LR_CTRL, weight_decay=WEIGHT_DECAY)
         self.cbf_optimizer = torch.optim.Adam(cbf.parameters(), lr=LR_CBF, weight_decay=WEIGHT_DECAY)
-        self.action_loss_weight = action_loss_weight
+        self.action_loss_weight, self.eps_action = action_loss_weight, eps_action
         self.lr_decay_stepsize = lr_decay_stepsize
         if lr_decay_stepsize >= 0:
             self.cbf_lr_scheduler = torch.optim.lr_scheduler.StepLR(self.cbf_optimizer, lr_decay_stepsize, 0.5)
@@ -275,6 +355,8 @@ class Trainer:
 
     @staticmethod
     def get_mask(state, obstacle):
+        """Per-obstacle class masks (safe, dangerous, mid), each (bs, k), from the distance
+        between state (bs, 6) and obstacle (bs, k, 6) in metres."""
         dist = (state[:, None, :3] - obstacle[:, :, :3]).norm(dim=2)       # (bs, k)
         safe = (dist >= SAFE_DIST).float()
         dang = (dist <= DANG_DIST).float()
@@ -284,16 +366,19 @@ class Trainer:
         """Chain the SABLAS construction over a window of K real transitions.
         state (bs, K+1, 6), obstacle (bs, K+1, k, 6), u_nominal (bs, K, 3), state_error (bs, K, 6).
         Returns xbar (bs, K, 6), the states at steps 1..K with the value of the real states
-        and the gradient of the nominal model w.r.t. all earlier commands, and u (bs, K, 3)."""
+        and the gradient of the nominal model w.r.t. all earlier commands, and the raw
+        (unsaturated) commands u (bs, K, 3). The nominal model sees the saturated command,
+        so there is no gradient through a saturated thruster."""
         x, xbar, us = state[:, 0], [], []
         for j in range(u_nominal.shape[1]):
             u = self.controller(x, obstacle[:, j], u_nominal[:, j], state_error[:, j])
-            x_nominal = x + nominal_dynamics(x, u) * E.DT
+            x_nominal = x + nominal_dynamics(x, torch.clamp(u, -1.0, 1.0)) * E.DT
             x = x_nominal + (state[:, j + 1] - x_nominal).detach()
             xbar.append(x); us.append(u)
         return torch.stack(xbar, 1), torch.stack(us, 1)
 
     def compute_loss(self, state, obstacle, u_nominal, state_error):
+        """SABLAS loss and accuracy vector [h>=0 safe, h<0 dang, deriv>0 safe/dang/mid]."""
         bs, K, k = u_nominal.shape[0], u_nominal.shape[1], obstacle.shape[2]
         state_next_with_grad, u = self.unroll(state, obstacle, u_nominal, state_error)
         s_now, o_now = state[:, :K].reshape(bs * K, 6), obstacle[:, :K].reshape(bs * K, k, 6)
@@ -310,7 +395,7 @@ class Trainer:
         loss_d_safe = (relu(EPS_DERIV - deriv) * safe).sum() / (1e-5 + ns)
         loss_d_dang = (relu(EPS_DERIV - deriv) * dang).sum() / (1e-5 + nd)
         loss_d_mid = (relu(EPS_DERIV - deriv) * mid).sum() / (1e-5 + nm)
-        loss_action = relu((u - u_nominal).abs() - EPS_ACTION).mean()
+        loss_action = relu((u - u_nominal).abs() - self.eps_action).mean()
         loss = (loss_h_safe + loss_h_dang + loss_d_safe + loss_d_dang + loss_d_mid
                 + loss_action * self.action_loss_weight)
 
@@ -323,6 +408,7 @@ class Trainer:
         return loss, acc
 
     def train_cbf_and_controller(self, rng, batch_size=1024, opt_iter=100):
+        """opt_iter joint updates on batches from the replay buffers; returns mean loss and accuracy."""
         loss_np, acc_np = 0.0, np.zeros(5)
         for _ in range(opt_iter):
             batch = [T(a) for a in self.dataset.sample_data(batch_size, rng)]
@@ -338,14 +424,20 @@ class Trainer:
 
 # ---------------------------------------------------------------- training loop (repo: scripts/train_drone.py)
 def save(path, agent, hist):
+    """Checkpoint: weights, architecture flags, environment constants and the err gain."""
     torch.save({"cbf": agent.cbf.state_dict(), "controller": agent.controller.state_dict(),
-                "ca_features": agent.ca, "cbf_act": agent.cbf_act, "cbf_prior": agent.cbf_prior, "hist": hist, "M_DEB": E.M_DEB, "U_MAX": E.U_MAX,
+                "ca_features": agent.ca, "cbf_act": agent.cbf_act, "cbf_prior": agent.cbf_prior,
+                "hist": hist, "M_DEB": E.M_DEB, "U_MAX": E.U_MAX, "err_gain": ERR_GAIN,
                 "horizon": getattr(agent, "horizon", 1)}, path)
 
 
 def load(path):
+    """Load a checkpoint. Side effect: sets cw_env.M_DEB / U_MAX and this module's ERR_GAIN
+    to the values the agent was trained with (old checkpoints without err_gain use 1.0)."""
+    global ERR_GAIN
     ck = torch.load(path, map_location=DEV)
     E.M_DEB, E.U_MAX = ck["M_DEB"], ck["U_MAX"]
+    ERR_GAIN = ck.get("err_gain", 1.0)
     ag = Agent(ck["ca_features"], ck.get("cbf_act", "relu"), ck.get("cbf_prior", False)).to(DEV)
     ag.cbf.load_state_dict(ck["cbf"]); ag.controller.load_state_dict(ck["controller"]); ag.eval()
     return ag, ck["hist"]
@@ -353,20 +445,23 @@ def load(path):
 
 def train(train_steps=1_000_000, n_env=32, update_interval=5000, opt_iter=100, batch=1024,
           seed=0, ckpt="sablas_torch_agent.pt", ca_features=False, lr_decay_stepsize=-1, horizon=1,
-          cbf_act="silu", cbf_prior=False):
+          cbf_act="silu", cbf_prior=False, eps_action=EPS_ACTION, action_weight=ACTION_LOSS_WEIGHT,
+          explore_noise=EXPLORE_NOISE):
     """train_steps and update_interval count environment steps (one spacecraft, one
     control period), as config.TRAIN_STEPS / POLICY_UPDATE_INTERVAL in the repo.
-    horizon: number of consecutive transitions per training window (1 = one-step loss)."""
+    horizon: number of consecutive transitions per training window (1 = one-step loss).
+    explore_noise: std of Gaussian noise added to the (normalised) command while collecting."""
     rng = np.random.default_rng(seed); torch.manual_seed(seed)
     agent = Agent(ca_features, cbf_act, cbf_prior).to(DEV)
     agent.horizon = horizon
     dataset = Dataset()
     win = {k_: [] for k_ in ("state", "obstacle", "u_nominal", "state_error")}   # last `horizon` steps
-    trainer = Trainer(agent.controller, agent.cbf, dataset, lr_decay_stepsize=lr_decay_stepsize)
+    trainer = Trainer(agent.controller, agent.cbf, dataset, action_weight, lr_decay_stepsize, eps_action)
 
     ep = E.Episodes(n_env, rng)
     err = np.zeros((n_env, 6))
     min_d = np.full(n_env, np.inf)
+    prev_r = ep.observe()[1][..., :3]                              # debris - spacecraft positions
     t = env_steps = 0
     next_update = update_interval
     collisions, hist, t0 = [], [], time.time()
@@ -377,8 +472,9 @@ def train(train_steps=1_000_000, n_env=32, update_interval=5000, opt_iter=100, b
         u_nom = E.pi_nom(own) / E.U_MAX
         with torch.no_grad():
             u_n = agent.controller(T(own), T(obstacle), T(u_nom), T(err)).cpu().numpy().astype(np.float64)
+        u_n = np.clip(u_n + explore_noise * rng.standard_normal(u_n.shape), -1.0, 1.0)   # explore, saturate
         u_cmd = u_n * E.U_MAX
-        ep.step(np.clip(u_cmd, -E.U_MAX, E.U_MAX))                 # black box, thruster saturates
+        ep.step(u_cmd)                                             # black box
         own2, rel2 = ep.observe()
         for k_, v in zip(win, (own, obstacle, u_nom, err)):
             win[k_] = (win[k_] + [v])[-horizon:]
@@ -387,13 +483,15 @@ def train(train_steps=1_000_000, n_env=32, update_interval=5000, opt_iter=100, b
                                 np.stack(win["obstacle"] + [rel2 + own2[:, None]], 1),
                                 np.stack(win["u_nominal"], 1), np.stack(win["state_error"], 1))
         err = (own2 - E.cw_step(own, u_cmd)) / dt_n()              # nominal-model error -> next input
-        min_d = np.minimum(min_d, np.linalg.norm(rel2[..., :3], axis=-1).min(1))
+        min_d = np.minimum(min_d, E.segment_min_dist(prev_r, rel2[..., :3]).min(1))
+        prev_r = rel2[..., :3]
         t += 1; env_steps += n_env
 
         if t == E.STEPS:                                           # episodes done -> reset
             collisions.extend((min_d < DANG_DIST).tolist())
             ep = E.Episodes(n_env, rng)
             err[:] = 0; min_d[:] = np.inf; t = 0
+            prev_r = ep.observe()[1][..., :3]
             win = {k_: [] for k_ in win}
 
         if env_steps >= next_update:
@@ -428,10 +526,17 @@ if __name__ == "__main__":
                     help="CBF hidden activation (repo: relu)")
     ap.add_argument("--cbf-prior", action="store_true",
                     help="h = distance prior + learned residual with range / range-rate inputs")
+    ap.add_argument("--eps-action", type=float, default=EPS_ACTION,
+                    help="free residual size in units of u_max (repo: 0.2 on its own scaling)")
+    ap.add_argument("--action-weight", type=float, default=ACTION_LOSS_WEIGHT)
+    ap.add_argument("--explore-noise", type=float, default=EXPLORE_NOISE,
+                    help="std of command noise (normalised) while collecting data")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ckpt", default="sablas_torch_agent.pt")
     a = ap.parse_args()
     E.M_DEB, E.U_MAX = a.debris, a.umax
-    print(f"device {DEV} | debris {E.M_DEB} | u_max {E.U_MAX} | horizon {a.horizon} | cbf {a.cbf_act}{'+prior' if a.cbf_prior else ''} | train steps {a.train_steps} | ckpt {a.ckpt}", flush=True)
+    print(f"device {DEV} | debris {E.M_DEB} | u_max {E.U_MAX} | horizon {a.horizon} | cbf {a.cbf_act}{'+prior' if a.cbf_prior else ''} | "
+          f"eps_action {a.eps_action} | explore {a.explore_noise} | train steps {a.train_steps} | ckpt {a.ckpt}", flush=True)
     train(a.train_steps, a.n_env, a.update_interval, a.opt_iter, a.batch, a.seed, a.ckpt,
-          a.ca_features, a.lr_decay, a.horizon, a.cbf_act, a.cbf_prior)
+          a.ca_features, a.lr_decay, a.horizon, a.cbf_act, a.cbf_prior,
+          eps_action=a.eps_action, action_weight=a.action_weight, explore_noise=a.explore_noise)
