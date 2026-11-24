@@ -196,7 +196,7 @@ def nominal_dynamics(state, u_n):
 
 
 # ---------------------------------------------------------------- run-time shield
-def qp_filter(u0, A, b, lo=-1.0, hi=1.0, iters=100, tol=1e-4):
+def qp_filter(u0, A, b, lo=-1.0, hi=1.0, iters=500, tol=1e-4):
     """Minimum-intervention filter, batched, numpy:
         min_u |u - u0|^2   s.t.   A u >= b,   lo <= u <= hi
     u0 (n, 3), A (n, k, 3), b (n, k). Solved by Dykstra's alternating projections onto the
@@ -263,7 +263,7 @@ class Agent(nn.Module):
         u_f, feasible = qp_filter(u0, A, b, iters=iters)
         return u_f, feasible, np.abs(u_f - u0).max(axis=1) > 1e-6
 
-    def make_policy(self, shield=False, shield_eps=0.0, gain_margin=0.7, iters=100):
+    def make_policy(self, shield=False, shield_eps=0.0, gain_margin=0.7, iters=500):
         """Policy for cw_env.rollout(own, rel) -> u [m/s^2]. Keeps the previous state
         and the previous (saturated, shielded) command to compute state_error, as in the
         repo; use a fresh one per rollout. With shield=True the learned CBF condition is
