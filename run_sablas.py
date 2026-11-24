@@ -147,15 +147,13 @@ def unit_checks(a, debris, umax):
         net, tr.controller = tr.controller, lambda x, o, un_, e: un_ + next(it)
         xb, _ = tr.unroll(st_w, ob_w, un_w, er_w)
         tr.controller = net
-        return (torch.autograd.grad(xb[0, 1, 0], probe[0], allow_unused=True)[0],
+        return (torch.autograd.grad(xb[0, 1, 0], probe[0], allow_unused=True, create_graph=True, retain_graph=True)[0],
                 torch.autograd.grad(xb[0, 0, 3], probe[0], allow_unused=True)[0])
-    
-    with torch.no_grad():
-        gp, _ = probe_grad(0.0)
+
+    gp, _ = probe_grad(0.0)
     report("multi-step: d p[t+2] / d u[t] = dt^2 * u_max", abs(gp[0, 0].item() - E.DT**2 * E.U_MAX) < 1e-3,
            f"(got {gp[0, 0].item():.3f}, expected {E.DT**2 * E.U_MAX:.3f})")
-    with torch.no_grad():
-        gp_sat, gv_sat = probe_grad(5.0)                                   # command far beyond the thruster limit
+    gp_sat, gv_sat = probe_grad(5.0)                                   # command far beyond the thruster limit
     report("no gradient through a saturated thruster",
            (gp_sat is None or gp_sat.abs().max().item() < 1e-9) and (gv_sat is None or gv_sat.abs().max().item() < 1e-9))
     ds_w = S.Dataset(); ds_w.add_windows(*(x.cpu().numpy() for x in (st_w, ob_w, un_w, er_w)))
