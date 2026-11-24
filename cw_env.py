@@ -24,7 +24,7 @@ N_MEAN = np.sqrt(MU / A_REF**3)          # ~1.107e-3 rad/s
 
 DT = 10.0                                # control period [s]
 N_SUB = 2
-STEPS = 120                              # 20 min episodes
+STEPS = 120                             # 20 min episodes
 M_DEB = 3                                # debris pieces per episode
 D_SAFE = 2500.0                           # keep-out radius [m]
 U_MAX = 0.05                             # per-axis thrust accel [m/s^2]
@@ -36,6 +36,23 @@ ROT_ERR = np.array([[_c, -_s, 0], [_s, _c, 0], [0, 0, 1.0]])
 
 # ---------------------------------------------------------------- CW nominal model
 def cw_A(n=N_MEAN):
+    """
+    Clohessy-Wiltshire (Hill) linearized relative motion, state s = [x, y, z, vx, vy, vz]
+    x: radial, y: along-track, z: cross-track; n: mean motion of the circular reference orbit.
+
+        x'' =  3 n^2 x + 2 n y'
+        y'' = -2 n x'
+        z'' = -n^2 z
+
+    ds/dt = A s, with
+
+        A = [  0     0    0    1    0    0 ]
+            [  0     0    0    0    1    0 ]
+            [  0     0    0    0    0    1 ]
+            [ 3n^2   0    0    0   2n    0 ]
+            [  0     0    0  -2n    0    0 ]
+            [  0     0  -n^2    0    0    0 ]
+    """
     A = np.zeros((6, 6))
     A[:3, 3:] = np.eye(3)
     A[3, 0] = 3 * n**2; A[3, 4] = 2 * n
