@@ -1,0 +1,35 @@
+# --- from upstream MIT-REALM/sablas
+__pycache__
+*.pth
+*.zip
+*.out
+*.json
+data
+visualize
+
+# --- model weights and checkpoints (large)
+*.pt
+*.ckpt
+*.npz
+*.npy
+*.pkl
+
+# --- training / evaluation output
+runs/
+logs/
+*.log
+results*.png
+smoke*
+
+# --- archives
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# --- Python / tooling
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+.DS_Store
